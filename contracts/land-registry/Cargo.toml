@@ -1,0 +1,15 @@
+[package]
+name = "land-registry"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GroundTruth land title registry contract on Soroban"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = [] }
+
+[profile.release]
+overflow-checks = true
