@@ -169,4 +169,47 @@ impl LandRegistry {
 
         Ok(record)
     }
+
+    // -------------------------------------------------------------------------
+    // Read-only
+    // -------------------------------------------------------------------------
+
+    /// Return the `TitleRecord` for `title_id`, or `TitleNotFound` if absent.
+    pub fn get_title(env: Env, title_id: BytesN<32>) -> Result<TitleRecord, ContractError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id))
+            .ok_or(ContractError::TitleNotFound)
+    }
+
+    /// Return the pending `TransferProposal` for `title_id`, if one exists.
+    /// Returns `None` when no proposal is in flight (normal state).
+    pub fn get_pending_transfer(
+        env: Env,
+        title_id: BytesN<32>,
+    ) -> Option<crate::types::TransferProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TransferProposal(title_id))
+    }
+
+    /// Return `true` iff `candidate_hash` matches the `doc_hash` stored for
+    /// `title_id`. Returns `TitleNotFound` if the title does not exist.
+    ///
+    /// This is the primary on-chain verification primitive: a caller hashes the
+    /// document they hold off-chain and passes it here; the contract confirms
+    /// whether it matches what was anchored at registration time.
+    pub fn verify_hash(
+        env: Env,
+        title_id: BytesN<32>,
+        candidate_hash: BytesN<32>,
+    ) -> Result<bool, ContractError> {
+        let record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        Ok(record.doc_hash == candidate_hash)
+    }
 }
