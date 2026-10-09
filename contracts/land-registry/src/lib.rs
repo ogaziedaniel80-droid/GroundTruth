@@ -395,4 +395,59 @@ impl LandRegistry {
 
         Ok(())
     }
+
+    /// Cancel a pending transfer proposal.
+    ///
+    /// May be called by the original proposer (owner who initiated) or by the
+    /// contract admin. Clears the proposal and reverts the title status to
+    /// `Active`. Anyone else receives `NotAuthorized`.
+    ///
+    /// Emits event `("transfer", "cancel")`.
+    pub fn cancel_transfer(
+        env: Env,
+        caller: Address,
+        title_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let proposal: TransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferProposal(title_id.clone()))
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+
+        // Only the original proposer or the admin may cancel
+        if caller != proposal.proposer && caller != admin {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        let mut record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id.clone()))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        record.status = TitleStatus::Active;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TitleRecord(title_id.clone()), &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TransferProposal(title_id.clone()));
+
+        env.events().publish(
+            (symbol_short!("transfer"), symbol_short!("cancel")),
+            title_id,
+        );
+
+        Ok(())
+    }
 }
