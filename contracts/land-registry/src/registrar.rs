@@ -49,7 +49,7 @@ pub fn remove_registrar_internal(env: &Env, registrar: &Address) -> Result<(), C
 
 pub fn validate_threshold(env: &Env, threshold: u32) -> Result<(), ContractError> {
     let registrars = get_registrars(env);
-    if threshold == 0 || threshold > registrars.len() as u32 {
+    if threshold == 0 || threshold > registrars.len() {
         return Err(ContractError::InvalidThreshold);
     }
     Ok(())

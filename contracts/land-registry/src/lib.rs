@@ -19,14 +19,30 @@ pub mod types;
 pub mod errors;
 pub mod registrar;
 
-use soroban_sdk::{Address, BytesN, Env, String, Vec, contract, contractimpl, symbol_short};
+use soroban_sdk::{Address, BytesN, Env, String, Vec, contract, contractimpl, contracttype};
 
-use crate::types::{DataKey, TitleRecord, TitleStatus, TransferProposal};
+use crate::types::{
+    DataKey, DisputeFlagged, DisputeResolved, TitleRecord, TitleRegistered, TitleStatus,
+    TransferCancelled, TransferCoSigned, TransferExecuted, TransferInitiated, TransferProposal,
+};
 use crate::errors::ContractError;
 use crate::registrar::{
     add_registrar_internal, get_threshold, is_registrar, remove_registrar_internal,
     validate_threshold, set_threshold,
 };
+
+/// Input parameters for `register_title`. Bundled into a struct so the
+/// function stays within clippy's 7-argument limit while keeping all fields
+/// from the README's Data model.
+#[contracttype]
+pub struct RegisterTitleParams {
+    pub id: BytesN<32>,
+    pub doc_hash: BytesN<32>,
+    pub storage_ref: String,
+    pub gps_lat: i64,
+    pub gps_lng: i64,
+    pub owner: Address,
+}
 
 #[contract]
 pub struct LandRegistry;
@@ -51,7 +67,7 @@ impl LandRegistry {
             return Err(ContractError::InvalidThreshold);
         }
 
-        if threshold == 0 || threshold > registrars.len() as u32 {
+        if threshold == 0 || threshold > registrars.len() {
             return Err(ContractError::InvalidThreshold);
         }
 
@@ -106,51 +122,43 @@ impl LandRegistry {
 
     /// Register a new title document on-chain.
     ///
-    /// Only a current registrar may anchor a title. The `id` must be unique;
-    /// passing a duplicate returns `TitleAlreadyExists`. `doc_hash` is the
-    /// SHA-256 of the off-chain document. `storage_ref` is an IPFS CID or
-    /// encrypted object-store URL pointing to the actual document. GPS
-    /// coordinates are stored as fixed-point integers (value × 10⁷).
+    /// Only a current registrar may anchor a title. `params.id` must be
+    /// unique; a duplicate returns `TitleAlreadyExists`. `params.doc_hash` is
+    /// the SHA-256 of the off-chain document. `params.storage_ref` is an IPFS
+    /// CID or encrypted object-store URL. GPS coordinates are fixed-point
+    /// integers (value × 10⁷).
     ///
-    /// Emits event `("title", "registered")` with the title id as data.
+    /// Emits `TitleRegistered`.
     pub fn register_title(
         env: Env,
         registrar: Address,
-        id: BytesN<32>,
-        doc_hash: BytesN<32>,
-        storage_ref: String,
-        gps_lat: i64,
-        gps_lng: i64,
-        owner: Address,
+        params: RegisterTitleParams,
     ) -> Result<TitleRecord, ContractError> {
-        // Contract must already be initialized
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(ContractError::NotInitialized);
         }
 
-        // Caller must be a registered registrar
         if !is_registrar(&env, &registrar) {
             return Err(ContractError::NotAuthorized);
         }
         registrar.require_auth();
 
-        // Reject duplicate title ids
         if env
             .storage()
             .persistent()
-            .has(&DataKey::TitleRecord(id.clone()))
+            .has(&DataKey::TitleRecord(params.id.clone()))
         {
             return Err(ContractError::TitleAlreadyExists);
         }
 
         let now = env.ledger().timestamp();
         let record = TitleRecord {
-            id: id.clone(),
-            doc_hash,
-            storage_ref,
-            gps_lat,
-            gps_lng,
-            owner,
+            id: params.id.clone(),
+            doc_hash: params.doc_hash,
+            storage_ref: params.storage_ref,
+            gps_lat: params.gps_lat,
+            gps_lng: params.gps_lng,
+            owner: params.owner.clone(),
             status: TitleStatus::Active,
             created_at: now,
             updated_at: now,
@@ -158,16 +166,94 @@ impl LandRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::TitleRecord(id.clone()), &record);
+            .set(&DataKey::TitleRecord(params.id.clone()), &record);
 
-        // Every state transition emits a Soroban event so the Day-6 indexer
-        // can replay the full history without trusting any off-chain cache.
-        env.events().publish(
-            (symbol_short!("title"), symbol_short!("register")),
-            id,
-        );
+        env.events().publish_event(&TitleRegistered {
+            title_id: params.id,
+            owner: params.owner,
+        });
 
         Ok(record)
+    }
+
+    /// Flag a title as disputed.
+    ///
+    /// A registrar may flag any title regardless of current status. Emits
+    /// `DisputeFlagged`.
+    pub fn flag_dispute(
+        env: Env,
+        registrar: Address,
+        title_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        if !is_registrar(&env, &registrar) {
+            return Err(ContractError::NotAuthorized);
+        }
+        registrar.require_auth();
+
+        let mut record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id.clone()))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        if record.status == TitleStatus::Disputed {
+            return Ok(());
+        }
+
+        record.status = TitleStatus::Disputed;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TitleRecord(title_id.clone()), &record);
+
+        env.events().publish_event(&DisputeFlagged {
+            title_id,
+            registrar,
+        });
+
+        Ok(())
+    }
+
+    /// Resolve a disputed title by setting it to an explicit new status.
+    ///
+    /// Only `Active` and `Revoked` are valid target statuses — passing
+    /// `Disputed` or `PendingTransfer` returns `InvalidStatusTransition`.
+    /// Emits `DisputeResolved`.
+    pub fn resolve_dispute(
+        env: Env,
+        registrar: Address,
+        title_id: BytesN<32>,
+        new_status: TitleStatus,
+    ) -> Result<(), ContractError> {
+        if !is_registrar(&env, &registrar) {
+            return Err(ContractError::NotAuthorized);
+        }
+        registrar.require_auth();
+
+        if new_status == TitleStatus::Disputed || new_status == TitleStatus::PendingTransfer {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+
+        let mut record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id.clone()))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        record.status = new_status;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TitleRecord(title_id.clone()), &record);
+
+        env.events().publish_event(&DisputeResolved {
+            title_id,
+            registrar,
+        });
+
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -183,11 +269,10 @@ impl LandRegistry {
     }
 
     /// Return the pending `TransferProposal` for `title_id`, if one exists.
-    /// Returns `None` when no proposal is in flight (normal state).
     pub fn get_pending_transfer(
         env: Env,
         title_id: BytesN<32>,
-    ) -> Option<crate::types::TransferProposal> {
+    ) -> Option<TransferProposal> {
         env.storage()
             .persistent()
             .get(&DataKey::TransferProposal(title_id))
@@ -195,10 +280,6 @@ impl LandRegistry {
 
     /// Return `true` iff `candidate_hash` matches the `doc_hash` stored for
     /// `title_id`. Returns `TitleNotFound` if the title does not exist.
-    ///
-    /// This is the primary on-chain verification primitive: a caller hashes the
-    /// document they hold off-chain and passes it here; the contract confirms
-    /// whether it matches what was anchored at registration time.
     pub fn verify_hash(
         env: Env,
         title_id: BytesN<32>,
@@ -218,21 +299,15 @@ impl LandRegistry {
     // -------------------------------------------------------------------------
 
     /// Proposal expiry: 7 days of ledger time (seconds).
-    /// 7 days gives registrars a practical window to co-sign without leaving
-    /// titles in PendingTransfer state indefinitely. The proposer can cancel
-    /// at any time before expiry if circumstances change.
+    /// Gives registrars a practical window to co-sign without leaving titles
+    /// in PendingTransfer state indefinitely. The proposer can cancel at any
+    /// time before expiry.
     const TRANSFER_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 
     /// Initiate an ownership-transfer proposal.
     ///
-    /// Only the current owner may propose a transfer. The title must be
-    /// `Active` — a title that is already `PendingTransfer`, `Disputed`, or
-    /// `Revoked` cannot have a new proposal opened. The proposal is stored
-    /// on-chain keyed by `title_id`; registrars then co-sign via
-    /// `co_sign_transfer`. Once enough approvals are collected the transfer
-    /// executes automatically inside `co_sign_transfer`.
-    ///
-    /// Emits event `("transfer", "initiate")`.
+    /// Only the current owner may propose. Title must be `Active`. Emits
+    /// `TransferInitiated`.
     pub fn initiate_transfer(
         env: Env,
         owner: Address,
@@ -247,17 +322,14 @@ impl LandRegistry {
             .get(&DataKey::TitleRecord(title_id.clone()))
             .ok_or(ContractError::TitleNotFound)?;
 
-        // Only the current owner may initiate
         if record.owner != owner {
             return Err(ContractError::NotAuthorized);
         }
 
-        // Title must be Active to accept a transfer proposal
         if record.status != TitleStatus::Active {
             return Err(ContractError::InvalidStatusTransition);
         }
 
-        // Reject a second concurrent proposal on the same title
         if env
             .storage()
             .persistent()
@@ -271,8 +343,8 @@ impl LandRegistry {
 
         let proposal = TransferProposal {
             title_id: title_id.clone(),
-            new_owner,
-            proposer: owner,
+            new_owner: new_owner.clone(),
+            proposer: owner.clone(),
             approvals: Vec::new(&env),
             threshold,
             expires_at,
@@ -288,22 +360,20 @@ impl LandRegistry {
             .persistent()
             .set(&DataKey::TransferProposal(title_id.clone()), &proposal);
 
-        env.events().publish(
-            (symbol_short!("transfer"), symbol_short!("initiate")),
+        env.events().publish_event(&TransferInitiated {
             title_id,
-        );
+            proposer: owner,
+            new_owner,
+        });
 
         Ok(proposal)
     }
 
     /// Co-sign a pending transfer proposal as a registrar.
     ///
-    /// Idempotent per registrar: a registrar cannot double-count their own
-    /// approval (`DuplicateApproval`). Rejects if the proposal has expired.
-    /// Once `approvals.len() >= threshold` the transfer executes automatically,
-    /// matching the README's note "(auto-fires once threshold met)."
-    ///
-    /// Emits event `("transfer", "cosign")` on each successful co-sign.
+    /// Idempotent per registrar (`DuplicateApproval` on repeat). Rejects
+    /// expired proposals. Auto-executes once `approvals.len() >= threshold`.
+    /// Emits `TransferCoSigned`, and `TransferExecuted` if threshold is met.
     pub fn co_sign_transfer(
         env: Env,
         registrar: Address,
@@ -320,43 +390,38 @@ impl LandRegistry {
             .get(&DataKey::TransferProposal(title_id.clone()))
             .ok_or(ContractError::ProposalNotFound)?;
 
-        // Reject expired proposals
         if env.ledger().timestamp() > proposal.expires_at {
             return Err(ContractError::ProposalExpired);
         }
 
-        // Idempotency guard — each registrar counts once
         if proposal.approvals.iter().any(|a| a == registrar) {
             return Err(ContractError::DuplicateApproval);
         }
 
         proposal.approvals.push_back(registrar.clone());
+        let approvals_count = proposal.approvals.len();
 
         env.storage()
             .persistent()
             .set(&DataKey::TransferProposal(title_id.clone()), &proposal);
 
-        env.events().publish(
-            (symbol_short!("transfer"), symbol_short!("cosign")),
-            title_id.clone(),
-        );
+        env.events().publish_event(&TransferCoSigned {
+            title_id: title_id.clone(),
+            registrar,
+            approvals_so_far: approvals_count,
+        });
 
-        // Auto-execute once threshold is met
-        if proposal.approvals.len() >= proposal.threshold {
+        if approvals_count >= proposal.threshold {
             Self::execute_transfer(env, title_id)?;
         }
 
         Ok(())
     }
 
-    /// Finalise an approved transfer, flipping ownership to `new_owner`.
+    /// Finalise an approved transfer.
     ///
-    /// Called automatically by `co_sign_transfer` when the approval threshold
-    /// is reached, but also exposed as a standalone entry-point so external
-    /// callers (e.g. a backend cron) can trigger execution after the threshold
-    /// has already been met (e.g. if a network issue interrupted `co_sign`).
-    ///
-    /// Emits event `("transfer", "execute")`.
+    /// Called automatically by `co_sign_transfer` when threshold is met, but
+    /// also exposed as a standalone entry-point. Emits `TransferExecuted`.
     pub fn execute_transfer(
         env: Env,
         title_id: BytesN<32>,
@@ -388,21 +453,18 @@ impl LandRegistry {
             .persistent()
             .remove(&DataKey::TransferProposal(title_id.clone()));
 
-        env.events().publish(
-            (symbol_short!("transfer"), symbol_short!("execute")),
+        env.events().publish_event(&TransferExecuted {
             title_id,
-        );
+            new_owner: proposal.new_owner,
+        });
 
         Ok(())
     }
 
     /// Cancel a pending transfer proposal.
     ///
-    /// May be called by the original proposer (owner who initiated) or by the
-    /// contract admin. Clears the proposal and reverts the title status to
-    /// `Active`. Anyone else receives `NotAuthorized`.
-    ///
-    /// Emits event `("transfer", "cancel")`.
+    /// Callable by the original proposer or the admin. Emits
+    /// `TransferCancelled`.
     pub fn cancel_transfer(
         env: Env,
         caller: Address,
@@ -422,7 +484,6 @@ impl LandRegistry {
             .get(&DataKey::Admin)
             .ok_or(ContractError::NotInitialized)?;
 
-        // Only the original proposer or the admin may cancel
         if caller != proposal.proposer && caller != admin {
             return Err(ContractError::NotAuthorized);
         }
@@ -443,10 +504,10 @@ impl LandRegistry {
             .persistent()
             .remove(&DataKey::TransferProposal(title_id.clone()));
 
-        env.events().publish(
-            (symbol_short!("transfer"), symbol_short!("cancel")),
+        env.events().publish_event(&TransferCancelled {
             title_id,
-        );
+            cancelled_by: caller,
+        });
 
         Ok(())
     }
