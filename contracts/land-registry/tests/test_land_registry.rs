@@ -1,4 +1,4 @@
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, BytesN, Env, String, Vec};
 use land_registry::{LandRegistry, LandRegistryClient, types::DataKey, errors::ContractError};
 
 // ---------------------------------------------------------------------------
@@ -355,4 +355,221 @@ fn test_verify_hash_title_not_found() {
 
     let result = client.try_verify_hash(&bytes32(&env, 50), &bytes32(&env, 50));
     assert_eq!(result.unwrap_err().unwrap(), ContractError::TitleNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// Transfer flow tests (multisig co-sign)
+// ---------------------------------------------------------------------------
+
+/// Helper: register a title owned by `owner` and return its id.
+fn register_title_for(
+    env: &Env,
+    client: &LandRegistryClient,
+    registrar: &Address,
+    seed: u8,
+    owner: &Address,
+) -> BytesN<32> {
+    let id = bytes32(env, seed);
+    client.register_title(
+        registrar,
+        &id,
+        &bytes32(env, seed),
+        &storage_ref(env),
+        &0,
+        &0,
+        owner,
+    );
+    id
+}
+
+#[test]
+fn test_initiate_transfer_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 10, &owner);
+
+    let proposal = client.initiate_transfer(&owner, &id, &new_owner);
+    assert_eq!(proposal.proposer, owner);
+    assert_eq!(proposal.new_owner, new_owner);
+    assert_eq!(proposal.approvals.len(), 0);
+
+    // Title status should now be PendingTransfer
+    use land_registry::types::TitleStatus;
+    let record = client.get_title(&id);
+    assert_eq!(record.status, TitleStatus::PendingTransfer);
+}
+
+#[test]
+fn test_initiate_transfer_fails_non_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 11, &owner);
+
+    let result = client.try_initiate_transfer(&impostor, &id, &Address::generate(&env));
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+#[test]
+fn test_initiate_transfer_fails_duplicate_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 12, &owner);
+
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+    let result = client.try_initiate_transfer(&owner, &id, &Address::generate(&env));
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidStatusTransition);
+}
+
+#[test]
+fn test_cosign_transfer_fails_non_registrar() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 13, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    let stranger = Address::generate(&env);
+    let result = client.try_co_sign_transfer(&stranger, &id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+#[test]
+fn test_cosign_transfer_fails_duplicate_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 14, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    client.co_sign_transfer(&r2, &id);
+    let result = client.try_co_sign_transfer(&r2, &id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::DuplicateApproval);
+}
+
+#[test]
+fn test_transfer_full_happy_path_auto_executes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+    // threshold is 2 (set in setup_initialized)
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 20, &owner);
+
+    client.initiate_transfer(&owner, &id, &new_owner);
+
+    // First co-sign — threshold not yet met
+    client.co_sign_transfer(&r1, &id);
+    let record = client.get_title(&id);
+    use land_registry::types::TitleStatus;
+    assert_eq!(record.status, TitleStatus::PendingTransfer);
+    assert_eq!(record.owner, owner);
+
+    // Second co-sign hits threshold → auto-executes
+    client.co_sign_transfer(&r2, &id);
+    let record = client.get_title(&id);
+    assert_eq!(record.status, TitleStatus::Active);
+    assert_eq!(record.owner, new_owner);
+
+    // Proposal should be cleared
+    assert!(client.get_pending_transfer(&id).is_none());
+}
+
+#[test]
+fn test_execute_transfer_fails_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 21, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+    client.co_sign_transfer(&r1, &id); // only 1 of 2 required
+
+    let result = client.try_execute_transfer(&id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+#[test]
+fn test_cosign_transfer_fails_expired_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 22, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    // Jump ledger time past the 7-day expiry
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    let result = client.try_co_sign_transfer(&r2, &id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::ProposalExpired);
+}
+
+#[test]
+fn test_cancel_transfer_by_proposer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 23, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    client.cancel_transfer(&owner, &id);
+
+    use land_registry::types::TitleStatus;
+    let record = client.get_title(&id);
+    assert_eq!(record.status, TitleStatus::Active);
+    assert!(client.get_pending_transfer(&id).is_none());
+}
+
+#[test]
+fn test_cancel_transfer_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 24, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    client.cancel_transfer(&admin, &id);
+
+    use land_registry::types::TitleStatus;
+    assert_eq!(client.get_title(&id).status, TitleStatus::Active);
+}
+
+#[test]
+fn test_cancel_transfer_fails_for_stranger() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 25, &owner);
+    client.initiate_transfer(&owner, &id, &Address::generate(&env));
+
+    let stranger = Address::generate(&env);
+    let result = client.try_cancel_transfer(&stranger, &id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
 }
