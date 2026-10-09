@@ -1,5 +1,5 @@
 use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, BytesN, Env, String, Vec};
-use land_registry::{LandRegistry, LandRegistryClient, types::DataKey, errors::ContractError};
+use land_registry::{LandRegistry, LandRegistryClient, RegisterTitleParams, types::DataKey, errors::ContractError};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -237,12 +237,14 @@ fn test_register_title_success() {
     // `register_title` returns TitleRecord directly on success
     let record = client.register_title(
         &r1,
-        &id,
-        &doc_hash,
-        &storage_ref(&env),
-        &139_218_340,
-        &33_488_350,
-        &Address::generate(&env),
+        &RegisterTitleParams {
+            id: id.clone(),
+            doc_hash: doc_hash.clone(),
+            storage_ref: storage_ref(&env),
+            gps_lat: 139_218_340,
+            gps_lng: 33_488_350,
+            owner: Address::generate(&env),
+        },
     );
     assert_eq!(record.id, id);
     assert_eq!(record.doc_hash, doc_hash);
@@ -256,9 +258,21 @@ fn test_register_title_fails_duplicate_id() {
 
     let id = bytes32(&env, 1);
     let owner = Address::generate(&env);
-    client.register_title(&r1, &id, &bytes32(&env, 1), &storage_ref(&env), &0, &0, &owner);
+    client.register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: bytes32(&env, 1),
+        storage_ref: storage_ref(&env),
+        gps_lat: 0, gps_lng: 0,
+        owner: owner.clone(),
+    });
 
-    let result = client.try_register_title(&r1, &id, &bytes32(&env, 2), &storage_ref(&env), &0, &0, &owner);
+    let result = client.try_register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: bytes32(&env, 2),
+        storage_ref: storage_ref(&env),
+        gps_lat: 0, gps_lng: 0,
+        owner: owner.clone(),
+    });
     assert_eq!(result.unwrap_err().unwrap(), ContractError::TitleAlreadyExists);
 }
 
@@ -271,12 +285,13 @@ fn test_register_title_fails_non_registrar() {
     let stranger = Address::generate(&env);
     let result = client.try_register_title(
         &stranger,
-        &bytes32(&env, 1),
-        &bytes32(&env, 1),
-        &storage_ref(&env),
-        &0,
-        &0,
-        &Address::generate(&env),
+        &RegisterTitleParams {
+            id: bytes32(&env, 1),
+            doc_hash: bytes32(&env, 1),
+            storage_ref: storage_ref(&env),
+            gps_lat: 0, gps_lng: 0,
+            owner: Address::generate(&env),
+        },
     );
     assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
 }
@@ -300,7 +315,14 @@ fn test_get_title_returns_registered_record() {
     let id = bytes32(&env, 5);
     let doc_hash = bytes32(&env, 77);
     let owner = Address::generate(&env);
-    client.register_title(&r1, &id, &doc_hash, &storage_ref(&env), &10_000_000, &20_000_000, &owner);
+    client.register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: doc_hash.clone(),
+        storage_ref: storage_ref(&env),
+        gps_lat: 10_000_000,
+        gps_lng: 20_000_000,
+        owner: owner.clone(),
+    });
 
     let record = client.get_title(&id);
     assert_eq!(record.owner, owner);
@@ -314,7 +336,13 @@ fn test_get_pending_transfer_none_when_no_proposal() {
     let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
 
     let id = bytes32(&env, 3);
-    client.register_title(&r1, &id, &bytes32(&env, 3), &storage_ref(&env), &0, &0, &Address::generate(&env));
+    client.register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: bytes32(&env, 3),
+        storage_ref: storage_ref(&env),
+        gps_lat: 0, gps_lng: 0,
+        owner: Address::generate(&env),
+    });
 
     let result = client.get_pending_transfer(&id);
     assert!(result.is_none());
@@ -328,7 +356,13 @@ fn test_verify_hash_correct() {
 
     let id = bytes32(&env, 7);
     let doc_hash = bytes32(&env, 99);
-    client.register_title(&r1, &id, &doc_hash, &storage_ref(&env), &0, &0, &Address::generate(&env));
+    client.register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: doc_hash.clone(),
+        storage_ref: storage_ref(&env),
+        gps_lat: 0, gps_lng: 0,
+        owner: Address::generate(&env),
+    });
 
     assert!(client.verify_hash(&id, &doc_hash));
 }
@@ -342,7 +376,13 @@ fn test_verify_hash_incorrect() {
     let id = bytes32(&env, 8);
     let doc_hash = bytes32(&env, 99);
     let wrong_hash = bytes32(&env, 11);
-    client.register_title(&r1, &id, &doc_hash, &storage_ref(&env), &0, &0, &Address::generate(&env));
+    client.register_title(&r1, &RegisterTitleParams {
+        id: id.clone(),
+        doc_hash: doc_hash.clone(),
+        storage_ref: storage_ref(&env),
+        gps_lat: 0, gps_lng: 0,
+        owner: Address::generate(&env),
+    });
 
     assert!(!client.verify_hash(&id, &wrong_hash));
 }
@@ -372,12 +412,14 @@ fn register_title_for(
     let id = bytes32(env, seed);
     client.register_title(
         registrar,
-        &id,
-        &bytes32(env, seed),
-        &storage_ref(env),
-        &0,
-        &0,
-        owner,
+        &RegisterTitleParams {
+            id: id.clone(),
+            doc_hash: bytes32(env, seed),
+            storage_ref: storage_ref(env),
+            gps_lat: 0,
+            gps_lng: 0,
+            owner: owner.clone(),
+        },
     );
     id
 }
@@ -572,4 +614,157 @@ fn test_cancel_transfer_fails_for_stranger() {
     let stranger = Address::generate(&env);
     let result = client.try_cancel_transfer(&stranger, &id);
     assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+// ---------------------------------------------------------------------------
+// Dispute flow tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_flag_dispute_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 30, &owner);
+
+    client.flag_dispute(&r2, &id);
+
+    use land_registry::types::TitleStatus;
+    assert_eq!(client.get_title(&id).status, TitleStatus::Disputed);
+}
+
+#[test]
+fn test_flag_dispute_fails_non_registrar() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, _r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 31, &owner);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_flag_dispute(&stranger, &id);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+#[test]
+fn test_flag_dispute_fails_title_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _r1, r2, _r3) = setup_initialized(&env);
+
+    let result = client.try_flag_dispute(&r2, &bytes32(&env, 99));
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::TitleNotFound);
+}
+
+#[test]
+fn test_resolve_dispute_to_active() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 32, &owner);
+    client.flag_dispute(&r2, &id);
+
+    use land_registry::types::TitleStatus;
+    client.resolve_dispute(&r2, &id, &TitleStatus::Active);
+    assert_eq!(client.get_title(&id).status, TitleStatus::Active);
+}
+
+#[test]
+fn test_resolve_dispute_to_revoked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 33, &owner);
+    client.flag_dispute(&r2, &id);
+
+    use land_registry::types::TitleStatus;
+    client.resolve_dispute(&r2, &id, &TitleStatus::Revoked);
+    assert_eq!(client.get_title(&id).status, TitleStatus::Revoked);
+}
+
+#[test]
+fn test_resolve_dispute_fails_into_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 34, &owner);
+    client.flag_dispute(&r2, &id);
+
+    use land_registry::types::TitleStatus;
+    let result = client.try_resolve_dispute(&r2, &id, &TitleStatus::Disputed);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidStatusTransition);
+}
+
+#[test]
+fn test_resolve_dispute_fails_non_registrar() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 35, &owner);
+    client.flag_dispute(&r2, &id);
+
+    let stranger = Address::generate(&env);
+    use land_registry::types::TitleStatus;
+    let result = client.try_resolve_dispute(&stranger, &id, &TitleStatus::Active);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::NotAuthorized);
+}
+
+#[test]
+fn test_initiate_transfer_fails_on_disputed_title() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, r1, r2, _r3) = setup_initialized(&env);
+
+    let owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 36, &owner);
+    client.flag_dispute(&r2, &id);
+
+    let result = client.try_initiate_transfer(&owner, &id, &Address::generate(&env));
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidStatusTransition);
+}
+
+#[test]
+fn test_execute_transfer_standalone_after_threshold_met() {
+    // Verify execute_transfer works as a standalone call (not only auto-fired
+    // by co_sign_transfer) — covers the README's "(auto-fires once threshold
+    // met)" note while also exposing the function as a standalone entry-point.
+    let env = Env::default();
+    env.mock_all_auths();
+    // Use threshold 1 so we can reach threshold with one co-sign, then
+    // call execute_transfer explicitly on an already-threshold-met proposal.
+    let admin = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let contract_id = env.register(LandRegistry, ());
+    let client = LandRegistryClient::new(&env, &contract_id);
+    let registrars = Vec::from_array(&env, [r1.clone(), r2.clone(), r3.clone()]);
+    // Initialize with threshold 3 so auto-execute does NOT fire on first cosign
+    client.initialize(&admin, &registrars, &3);
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let id = register_title_for(&env, &client, &r1, 40, &owner);
+    client.initiate_transfer(&owner, &id, &new_owner);
+
+    // Co-sign with all 3 — the third triggers auto-execute
+    client.co_sign_transfer(&r1, &id);
+    client.co_sign_transfer(&r2, &id);
+    client.co_sign_transfer(&r3, &id); // auto-executes here
+
+    use land_registry::types::TitleStatus;
+    let record = client.get_title(&id);
+    assert_eq!(record.owner, new_owner);
+    assert_eq!(record.status, TitleStatus::Active);
 }
