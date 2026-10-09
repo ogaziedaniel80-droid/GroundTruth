@@ -21,7 +21,7 @@ pub mod registrar;
 
 use soroban_sdk::{Address, BytesN, Env, String, Vec, contract, contractimpl, symbol_short};
 
-use crate::types::{DataKey, TitleRecord, TitleStatus};
+use crate::types::{DataKey, TitleRecord, TitleStatus, TransferProposal};
 use crate::errors::ContractError;
 use crate::registrar::{
     add_registrar_internal, get_threshold, is_registrar, remove_registrar_internal,
@@ -211,5 +211,188 @@ impl LandRegistry {
             .ok_or(ContractError::TitleNotFound)?;
 
         Ok(record.doc_hash == candidate_hash)
+    }
+
+    // -------------------------------------------------------------------------
+    // Transfer flow (registrar M-of-N multisig)
+    // -------------------------------------------------------------------------
+
+    /// Proposal expiry: 7 days of ledger time (seconds).
+    /// 7 days gives registrars a practical window to co-sign without leaving
+    /// titles in PendingTransfer state indefinitely. The proposer can cancel
+    /// at any time before expiry if circumstances change.
+    const TRANSFER_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+
+    /// Initiate an ownership-transfer proposal.
+    ///
+    /// Only the current owner may propose a transfer. The title must be
+    /// `Active` — a title that is already `PendingTransfer`, `Disputed`, or
+    /// `Revoked` cannot have a new proposal opened. The proposal is stored
+    /// on-chain keyed by `title_id`; registrars then co-sign via
+    /// `co_sign_transfer`. Once enough approvals are collected the transfer
+    /// executes automatically inside `co_sign_transfer`.
+    ///
+    /// Emits event `("transfer", "initiate")`.
+    pub fn initiate_transfer(
+        env: Env,
+        owner: Address,
+        title_id: BytesN<32>,
+        new_owner: Address,
+    ) -> Result<TransferProposal, ContractError> {
+        owner.require_auth();
+
+        let mut record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id.clone()))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        // Only the current owner may initiate
+        if record.owner != owner {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        // Title must be Active to accept a transfer proposal
+        if record.status != TitleStatus::Active {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+
+        // Reject a second concurrent proposal on the same title
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TransferProposal(title_id.clone()))
+        {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+
+        let threshold = get_threshold(&env);
+        let expires_at = env.ledger().timestamp() + Self::TRANSFER_EXPIRY_SECS;
+
+        let proposal = TransferProposal {
+            title_id: title_id.clone(),
+            new_owner,
+            proposer: owner,
+            approvals: Vec::new(&env),
+            threshold,
+            expires_at,
+        };
+
+        record.status = TitleStatus::PendingTransfer;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TitleRecord(title_id.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TransferProposal(title_id.clone()), &proposal);
+
+        env.events().publish(
+            (symbol_short!("transfer"), symbol_short!("initiate")),
+            title_id,
+        );
+
+        Ok(proposal)
+    }
+
+    /// Co-sign a pending transfer proposal as a registrar.
+    ///
+    /// Idempotent per registrar: a registrar cannot double-count their own
+    /// approval (`DuplicateApproval`). Rejects if the proposal has expired.
+    /// Once `approvals.len() >= threshold` the transfer executes automatically,
+    /// matching the README's note "(auto-fires once threshold met)."
+    ///
+    /// Emits event `("transfer", "cosign")` on each successful co-sign.
+    pub fn co_sign_transfer(
+        env: Env,
+        registrar: Address,
+        title_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        if !is_registrar(&env, &registrar) {
+            return Err(ContractError::NotAuthorized);
+        }
+        registrar.require_auth();
+
+        let mut proposal: TransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferProposal(title_id.clone()))
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        // Reject expired proposals
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(ContractError::ProposalExpired);
+        }
+
+        // Idempotency guard — each registrar counts once
+        if proposal.approvals.iter().any(|a| a == registrar) {
+            return Err(ContractError::DuplicateApproval);
+        }
+
+        proposal.approvals.push_back(registrar.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TransferProposal(title_id.clone()), &proposal);
+
+        env.events().publish(
+            (symbol_short!("transfer"), symbol_short!("cosign")),
+            title_id.clone(),
+        );
+
+        // Auto-execute once threshold is met
+        if proposal.approvals.len() >= proposal.threshold {
+            Self::execute_transfer(env, title_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Finalise an approved transfer, flipping ownership to `new_owner`.
+    ///
+    /// Called automatically by `co_sign_transfer` when the approval threshold
+    /// is reached, but also exposed as a standalone entry-point so external
+    /// callers (e.g. a backend cron) can trigger execution after the threshold
+    /// has already been met (e.g. if a network issue interrupted `co_sign`).
+    ///
+    /// Emits event `("transfer", "execute")`.
+    pub fn execute_transfer(
+        env: Env,
+        title_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let proposal: TransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferProposal(title_id.clone()))
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        if proposal.approvals.len() < proposal.threshold {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        let mut record: TitleRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TitleRecord(title_id.clone()))
+            .ok_or(ContractError::TitleNotFound)?;
+
+        record.owner = proposal.new_owner.clone();
+        record.status = TitleStatus::Active;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TitleRecord(title_id.clone()), &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TransferProposal(title_id.clone()));
+
+        env.events().publish(
+            (symbol_short!("transfer"), symbol_short!("execute")),
+            title_id,
+        );
+
+        Ok(())
     }
 }
